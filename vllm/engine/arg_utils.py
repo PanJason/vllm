@@ -8,7 +8,7 @@ from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
                          MultiModalConfig, ObservabilityConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig,
-                         TokenizerPoolConfig)
+                         TokenizerPoolConfig, DisaggregateConfig)
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.utils import FlexibleArgumentParser
 
@@ -96,6 +96,11 @@ class EngineArgs:
     qlora_adapter_name_or_path: Optional[str] = None
 
     otlp_traces_endpoint: Optional[str] = None
+
+    # Disaggregated configuration.
+    prefill_instance_size: Optional[int] = None # Number of p-only instances
+    decode_instance_size: Optional[int] = None # Number of d-only instances
+    prefill_decode_instance_size: Optional[int] = None # Number of pd instances
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -591,6 +596,24 @@ class EngineArgs:
             type=str,
             default=None,
             help='Target URL to which OpenTelemetry traces will be sent.')
+        
+        # Disaggregated arguments
+        parser.add_argument('--prefill-instance-size',
+                            type=int,
+                            default=None,
+                            help='Number of prefill-only instances.')
+        
+        parser.add_argument('--decode-instance-size',
+                            type=int,
+                            default=None,
+                            help='Number of decode-only instances.')
+        
+        parser.add_argument('--prefill-decode-instance-size',
+                            type=int,
+                            default=None,
+                            help='Number of prefill-decode colocated '
+                            'instances.')
+        
 
         return parser
 
@@ -690,6 +713,14 @@ class EngineArgs:
             typical_acceptance_sampler_posterior_alpha,
         )
 
+        disaggregate_config = DisaggregateConfig.maybe_create_disaggregate_config(
+            target_device_config=device_config,
+            target_parallel_config=parallel_config,
+            prefill_instance_size=self.prefill_instance_size,
+            decode_instance_size=self.decode_instance_size,
+            prefill_decode_instance_size=self.prefill_decode_instance_size,
+        )
+
         scheduler_config = SchedulerConfig(
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_seqs=self.max_num_seqs,
@@ -702,6 +733,7 @@ class EngineArgs:
             enable_chunked_prefill=self.enable_chunked_prefill,
             embedding_mode=model_config.embedding_mode,
             preemption_mode=self.preemption_mode,
+            disaggregated_mode=(disaggregate_config is not None),
         )
         lora_config = LoRAConfig(
             max_lora_rank=self.max_lora_rank,
@@ -751,6 +783,7 @@ class EngineArgs:
             load_config=load_config,
             decoding_config=decoding_config,
             observability_config=observability_config,
+            disaggregate_config=disaggregate_config,
         )
 
 

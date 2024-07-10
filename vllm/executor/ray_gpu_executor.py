@@ -111,6 +111,12 @@ class RayGPUExecutor(DistributedGPUExecutor):
             )
 
             worker_ip = ray.get(worker.get_node_ip.remote())
+            # NOTE: The workers are sorted in the following order:
+            # 1. PD (if any)
+            # 2. P (if any)
+            # 3. D (if any)
+            # So the driver worker is a PD worker or P worker
+            # TODO: remove driver_dummy_worker
             if worker_ip == driver_ip and self.driver_dummy_worker is None:
                 # If the worker is on the same node as the driver, we use it
                 # as the resource holder for the driver process.
@@ -202,16 +208,42 @@ class RayGPUExecutor(DistributedGPUExecutor):
         # broadcasted to.
         self.non_driver_workers: List[RayWorkerWrapper] = []
 
-        for pp_rank in range(self.parallel_config.pipeline_parallel_size):
-            for tp_rank in range(self.parallel_config.tensor_parallel_size):
-                rank = (pp_rank *
-                        self.parallel_config.tensor_parallel_size) + tp_rank
-                if rank == 0:
-                    pass
-                elif rank % self.parallel_config.tensor_parallel_size == 0:
-                    self.tp_driver_workers.append(self.workers[rank - 1])
-                else:
-                    self.non_driver_workers.append(self.workers[rank - 1])
+        self.prefill_decode_workers: List[RayWorkerWrapper] = []
+        self.prefill_workers: List[RayWorkerWrapper] = []
+        self.decode_workers: List[RayWorkerWrapper] = []
+
+        n_instances = (self.disaggregate_config.prefill_instance_size +
+                      self.disaggregate_config.decode_instance_size +
+                      self.disaggregate_config.prefill_decode_instance_size
+                      if self.disaggregate_config is not None else 1)
+        for ins in range(n_instances):
+            base_rank = (ins * 
+                         self.parallel_config.pipeline_parallel_size *
+                         self.parallel_config.tensor_parallel_size)
+            for pp_rank in range(self.parallel_config.pipeline_parallel_size):
+                for tp_rank in range(self.parallel_config.tensor_parallel_size):
+                    rank = ((pp_rank * self.parallel_config.tensor_parallel_size) 
+                            + tp_rank + base_rank)
+                    # rank among an instance
+                    ins_rank = ((pp_rank * self.parallel_config.tensor_parallel_size) 
+                            + tp_rank) 
+                    if rank == 0:
+                        pass
+                    elif ins_rank % self.parallel_config.tensor_parallel_size == 0:
+                        self.tp_driver_workers.append(self.workers[rank - 1])
+                    else:
+                        self.non_driver_workers.append(self.workers[rank - 1])
+
+                    if n_instances == 1:
+                        self.prefill_decode_workers.append(self.workers[rank - 1])
+                    else:
+                        if ins < self.disaggregate_config.prefill_decode_instance_size:
+                            self.prefill_decode_workers.append(self.workers[rank - 1])
+                        elif (ins < self.disaggregate_config.prefill_decode_instance_size + 
+                              self.disaggregate_config.prefill_instance_size):
+                            self.prefill_workers.append(self.workers[rank - 1])
+                        else:
+                            self.decode_workers.append(self.workers[rank - 1])
 
     def _driver_execute_model(
         self, execute_model_req: Optional[ExecuteModelRequest]

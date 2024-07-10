@@ -4,7 +4,7 @@ from typing import List, Optional, Set, Tuple
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, MultiModalConfig, ParallelConfig,
-                         SchedulerConfig, SpeculativeConfig)
+                         SchedulerConfig, SpeculativeConfig, DisaggregateConfig)
 from vllm.lora.request import LoRARequest
 from vllm.sequence import ExecuteModelRequest, SamplerOutput
 
@@ -28,6 +28,7 @@ class ExecutorBase(ABC):
         lora_config: Optional[LoRAConfig],
         multimodal_config: Optional[MultiModalConfig],
         speculative_config: Optional[SpeculativeConfig],
+        disaggregate_config: Optional[DisaggregateConfig],
     ) -> None:
         self.model_config = model_config
         self.cache_config = cache_config
@@ -38,6 +39,7 @@ class ExecutorBase(ABC):
         self.device_config = device_config
         self.multimodal_config = multimodal_config
         self.speculative_config = speculative_config
+        self.disaggregate_config = disaggregate_config
 
         self._init_executor()
 
@@ -122,12 +124,14 @@ class ExecutorAsyncBase(ExecutorBase):
         lora_config: Optional[LoRAConfig],
         multimodal_config: Optional[MultiModalConfig],
         speculative_config: Optional[SpeculativeConfig],
+        disaggregate_config: Optional[DisaggregateConfig],
     ) -> None:
         self.pp_locks: Optional[List[asyncio.Lock]] = None
 
         super().__init__(model_config, cache_config, parallel_config,
                          scheduler_config, device_config, load_config,
-                         lora_config, multimodal_config, speculative_config)
+                         lora_config, multimodal_config, speculative_config,
+                         disaggregate_config)
 
     @abstractmethod
     async def execute_model_async(

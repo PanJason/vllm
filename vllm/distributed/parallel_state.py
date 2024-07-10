@@ -145,7 +145,8 @@ class GroupCoordinator:
                 ranks, backend=torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            from datetime import timedelta
+            cpu_group = torch.distributed.new_group(ranks,timeout=timedelta(seconds=30), backend="gloo")
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
@@ -169,7 +170,6 @@ class GroupCoordinator:
             CustomAllreduce)
         from vllm.distributed.device_communicators.pynccl import (
             PyNcclCommunicator)
-
         self.pynccl_comm: Optional[PyNcclCommunicator]
         if use_pynccl and self.world_size > 1:
             self.pynccl_comm = PyNcclCommunicator(
@@ -699,6 +699,7 @@ class GroupCoordinator:
         if self.shm_broadcaster is not None:
             self.shm_broadcaster = None
 
+_ENABLE_PD_DISAGGREGATE: bool = False
 
 _WORLD: Optional[GroupCoordinator] = None
 
@@ -758,6 +759,10 @@ def get_pp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
+_PIs: Optional[List[GroupCoordinator]] = None
+_DIs: Optional[List[GroupCoordinator]] = None
+_PDIs: Optional[List[GroupCoordinator]] = None
+
 
 @contextmanager
 def graph_capture():
@@ -795,12 +800,26 @@ def init_distributed_environment(
     distributed_init_method: str = "env://",
     local_rank: int = -1,
     backend: str = "nccl",
+    prefill_instance_size: int = -1,
+    decode_instance_size: int = -1,
+    prefill_decode_instance_size: int = -1,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d "
+        "prefill_size=%d decode_size=%d prefill_decode_size=%d "
         "distributed_init_method=%s backend=%s", world_size, rank, local_rank,
+        prefill_instance_size, decode_instance_size, prefill_decode_instance_size, 
         distributed_init_method, backend)
+    global _ENABLE_PD_DISAGGREGATE
+    n_instances: int = (prefill_instance_size + decode_instance_size + 
+                  prefill_decode_instance_size)
+    _ENABLE_PD_DISAGGREGATE = True if n_instances > 0 else False
+    n_worker_per_instance: int = (world_size // n_instances 
+                                  if _ENABLE_PD_DISAGGREGATE is True 
+                                  else world_size)
+
     if not torch.distributed.is_initialized():
+        print("Initialize torch distributed", flush=True)
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment")
@@ -822,17 +841,44 @@ def init_distributed_environment(
             local_rank = rank
     global _WORLD
     if _WORLD is None:
-        ranks = list(range(torch.distributed.get_world_size()))
-        _WORLD = init_world_group(ranks, local_rank, backend)
+        if _ENABLE_PD_DISAGGREGATE is True:
+            # ins_rank: int = rank // n_worker_per_instance
+            # ranks = list(range(ins_rank * n_worker_per_instance,
+            #                 (ins_rank + 1) * n_worker_per_instance))
+            # assert world_size // len(ranks) == n_instances
+            # assert rank in ranks
+            ranks = []
+            for i in range(n_instances):
+                ranks.append(list(range(i * n_worker_per_instance,
+                            (i + 1) * n_worker_per_instance)))
+            # _WORLD = init_world_group(ranks, local_rank, backend)
+            _WORLD = GroupCoordinator(
+                group_ranks=ranks,
+                local_rank=local_rank,
+                torch_distributed_backend=backend,
+                use_pynccl=False,
+                use_custom_allreduce=False,
+            )
+        else:
+            ranks = list(range(torch.distributed.get_world_size()))
+            _WORLD = init_world_group(ranks, local_rank, backend)
     else:
-        assert _WORLD.world_size == torch.distributed.get_world_size(), (
-            "world group already initialized with a different world size")
+        if _ENABLE_PD_DISAGGREGATE is True:
+            assert _WORLD.world_size * n_instances == \
+                torch.distributed.get_world_size(), (
+                "world group already initialized with a different world size")
+        else:
+            assert _WORLD.world_size == torch.distributed.get_world_size(), (
+                "world group already initialized with a different world size")
 
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    prefill_instance_size: Optional[int] = -1,
+    decode_instance_size: Optional[int] = -1,
+    prefill_decode_instance_size: Optional[int] = -1,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -861,38 +907,56 @@ def initialize_model_parallel(
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(
         get_world_group().device_group)
-
-    if (world_size !=
-            tensor_model_parallel_size * pipeline_model_parallel_size):
+    ins_world_size: int = get_world_group().world_size
+    
+    n_instances = (prefill_instance_size + 
+                   decode_instance_size + 
+                   prefill_decode_instance_size)
+    n_instances = 1 if n_instances <= 0 else n_instances
+    
+    if (world_size != n_instances * 
+        tensor_model_parallel_size * pipeline_model_parallel_size):
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})")
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size}) x "
+            f"(prefill_instance_size ({prefill_instance_size}) + "
+            f"decode_instance_size ({decode_instance_size}) + "
+            f"prefill_decode_instance_size ({prefill_decode_instance_size}))")
 
     # Build the tensor model-parallel groups.
-    num_tensor_model_parallel_groups: int = (world_size //
+    num_tensor_model_parallel_groups: int = (ins_world_size //
                                              tensor_model_parallel_size)
+    
     global _TP
     assert _TP is None, ("tensor model parallel group is already initialized")
     group_ranks = []
-    for i in range(num_tensor_model_parallel_groups):
-        ranks = list(
-            range(i * tensor_model_parallel_size,
-                  (i + 1) * tensor_model_parallel_size))
-        group_ranks.append(ranks)
+    # TODO: Check whether we need to include all the ranks or not ??
+    for ins in range(n_instances):
+        worker_base_rank = ins * ins_world_size
+        for i in range(num_tensor_model_parallel_groups):
+            ranks = list(
+                range(worker_base_rank + i * tensor_model_parallel_size,
+                    worker_base_rank + (i + 1) * tensor_model_parallel_size))
+            group_ranks.append(ranks)
     _TP = init_model_parallel_group(group_ranks,
                                     get_world_group().local_rank, backend)
 
     # Build the pipeline model-parallel groups.
-    num_pipeline_model_parallel_groups: int = (world_size //
+    num_pipeline_model_parallel_groups: int = (ins_world_size //
                                                pipeline_model_parallel_size)
     global _PP
     assert _PP is None, (
         "pipeline model parallel group is already initialized")
     group_ranks = []
-    for i in range(num_pipeline_model_parallel_groups):
-        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
-        group_ranks.append(ranks)
+    # TODO: Check whether we need to include all the ranks or not ??
+    for ins in range(n_instances):
+        worker_base_rank = ins * ins_world_size
+        for i in range(num_pipeline_model_parallel_groups):
+            ranks = list(range(worker_base_rank + i,
+                            worker_base_rank + ins_world_size, 
+                            num_pipeline_model_parallel_groups))
+            group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
     _PP = init_model_parallel_group(group_ranks,
                                     get_world_group().local_rank,
@@ -904,6 +968,9 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    prefill_instance_size: Optional[int] = -1,
+    decode_instance_size: Optional[int] = -1,
+    prefill_decode_instance_size: Optional[int] = -1,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -913,7 +980,10 @@ def ensure_model_parallel_initialized(
         get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+                                  pipeline_model_parallel_size, backend,
+                                  prefill_instance_size, 
+                                  decode_instance_size,
+                                  prefill_decode_instance_size)
         return
 
     assert (

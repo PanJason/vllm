@@ -756,6 +756,8 @@ class SchedulerConfig:
             swapping. However, when the sequence group has multiple sequences
             (e.g., beam search), recomputation is not currently supported. In
             such a case, we use swapping instead.
+        disaggregated_mode: Whether prefill and decode disaggregation is enabled 
+            or not.
     """
 
     def __init__(self,
@@ -767,7 +769,8 @@ class SchedulerConfig:
                  delay_factor: float = 0.0,
                  enable_chunked_prefill: bool = False,
                  embedding_mode: Optional[bool] = False,
-                 preemption_mode: Optional[str] = None) -> None:
+                 preemption_mode: Optional[str] = None,
+                 disaggregated_mode: Optional[bool] = False) -> None:
         if max_num_batched_tokens is not None:
             self.max_num_batched_tokens = max_num_batched_tokens
         else:
@@ -794,6 +797,7 @@ class SchedulerConfig:
         self.chunked_prefill_enabled = enable_chunked_prefill
         self.embedding_mode = embedding_mode
         self.preemption_mode = preemption_mode
+        self.disaggregated_mode = disaggregated_mode
         self._verify_args()
 
     def _verify_args(self) -> None:
@@ -852,6 +856,91 @@ class DeviceConfig:
             # Set device with device type
             self.device = torch.device(self.device_type)
 
+class DisaggregateConfig:
+    """Configuration for prefilling and decoding disaggregation
+
+    The configuration currently applies to gpu device and ray backend
+    """
+    @staticmethod
+    def maybe_create_disaggregate_config(
+        target_device_config: DeviceConfig,
+        target_parallel_config: ParallelConfig,
+        prefill_instance_size: Optional[int],
+        decode_instance_size: Optional[int],
+        prefill_decode_instance_size: Optional[int],
+    ) -> Optional["DisaggregateConfig"]:
+        """Create a DisaggregateConfig if possible, else return None.
+
+        This function attempts to create a DisaggregateConfig object based on the
+        provided parameters. If the necessary conditions are met, it returns an
+        instance of DisaggregateConfig. Otherwise, it returns None.
+        
+        Args:
+            target_device_config (DeviceConfig): The configuration of the target 
+                device.
+            target_parallel_config (ParallelConfig): The parallel configuration
+                for the target model.
+            prefill_instance_size (Optional[int]): Number of prefill instances, 
+                if provided
+            decode_instance_size (Optional[int]): Number of decode instances, if 
+                provided
+            prefill_decode_instance_size (Optional[int]): Number of prefill-decode 
+                colocated instances, if provided
+
+        Returns:
+            Optional["DisaggregateConfig"]: An instance of DisaggregateConfig if
+                the necessary conditions are met, else None.
+        """
+        if target_device_config.device_type != "cuda":
+            return None
+        if target_parallel_config.distributed_executor_backend != "ray":
+            return None
+        
+        if (prefill_instance_size is None and 
+            decode_instance_size is None and
+            prefill_decode_instance_size is None):
+            return None
+        
+        if (prefill_instance_size == 0 and 
+            decode_instance_size == 0 and
+            prefill_decode_instance_size == 0):
+            return None
+        
+        target_parallel_config.world_size *= (prefill_instance_size + \
+                                            decode_instance_size + \
+                                            prefill_decode_instance_size)
+
+        return DisaggregateConfig(
+            prefill_instance_size,
+            decode_instance_size,
+            prefill_decode_instance_size,
+        )
+
+    def __init__(
+        self,
+        prefill_instance_size: Optional[int],
+        decode_instance_size: Optional[int],
+        prefill_decode_instance_size: Optional[int],
+        ) -> None:
+        self.prefill_instance_size = prefill_instance_size or 0
+        self.decode_instance_size = decode_instance_size or 0
+        self.prefill_decode_instance_size = prefill_decode_instance_size or 0
+        self._verify_args()
+
+    def _verify_args(self) -> None:
+        # Only 1 prefill instance
+        if (self.prefill_instance_size != 0 and 
+            self.decode_instance_size == 0 and 
+            self.prefill_decode_instance_size == 0):
+            raise ValueError(f"#prefill instances is {self.prefill_instance_size} "
+                             "but no decode instance or prefill-decode colocated instance")
+
+        if (self.decode_instance_size != 0 and 
+            self.prefill_instance_size == 0 and 
+            self.prefill_decode_instance_size == 0):
+            raise ValueError(f"#decode instance is {self.decode_instance_size} "
+                             "but no prefill instance or prefill-deocde colocated instance") 
+    
 
 class SpeculativeConfig:
     """Configuration for speculative decoding.
@@ -1518,6 +1607,8 @@ class EngineConfig:
     speculative_config: Optional[SpeculativeConfig]
     decoding_config: Optional[DecodingConfig]
     observability_config: Optional[ObservabilityConfig]
+    # Right now it is frozen. Later we will enable configuration in each iteration
+    disaggregate_config: Optional[DisaggregateConfig]
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other.

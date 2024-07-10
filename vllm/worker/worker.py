@@ -8,7 +8,7 @@ import torch.distributed
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, MultiModalConfig, ParallelConfig,
-                         SchedulerConfig, SpeculativeConfig)
+                         SchedulerConfig, SpeculativeConfig, DisaggregateConfig)
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
@@ -45,6 +45,7 @@ class Worker(LocalOrDistributedWorkerBase):
         lora_config: Optional[LoRAConfig] = None,
         multimodal_config: Optional[MultiModalConfig] = None,
         speculative_config: Optional[SpeculativeConfig] = None,
+        disaggregate_config: Optional[DisaggregateConfig] = None, 
         is_driver_worker: bool = False,
         model_runner_cls: Optional[Type[GPUModelRunnerBase]] = None,
     ) -> None:
@@ -54,6 +55,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self.scheduler_config = scheduler_config
         self.device_config = device_config
         self.cache_config = cache_config
+        self.disaggregate_config = disaggregate_config
         self.local_rank = local_rank
         self.rank = rank
         self.distributed_init_method = distributed_init_method
@@ -82,6 +84,8 @@ class Worker(LocalOrDistributedWorkerBase):
             ModelRunnerClass = model_runner_cls
         elif self.model_config.embedding_mode:
             ModelRunnerClass = EmbeddingModelRunner
+
+        # TODO: Do we need to change model runner as well?
         self.model_runner: GPUModelRunnerBase = ModelRunnerClass(
             model_config,
             parallel_config,
@@ -125,7 +129,7 @@ class Worker(LocalOrDistributedWorkerBase):
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.parallel_config, self.rank,
                                             self.distributed_init_method,
-                                            self.local_rank)
+                                            self.local_rank, self.disaggregate_config)
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -317,15 +321,32 @@ def init_worker_distributed_environment(
     rank: int,
     distributed_init_method: Optional[str] = None,
     local_rank: int = -1,
+    disaggregate_config: Optional[DisaggregateConfig] = None,
 ) -> None:
     """Initialize the distributed environment."""
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+    prefill_instance_size = -1
+    decode_instance_size = -1
+    prefill_decode_instance_size = -1
+    if disaggregate_config is not None:
+        prefill_instance_size = \
+            disaggregate_config.prefill_instance_size
+        decode_instance_size = \
+            disaggregate_config.decode_instance_size
+        prefill_decode_instance_size = \
+            disaggregate_config.prefill_decode_instance_size
 
     init_distributed_environment(parallel_config.world_size, rank,
-                                 distributed_init_method, local_rank)
+                                 distributed_init_method, local_rank,
+                                 prefill_instance_size=prefill_instance_size,
+                                 decode_instance_size=decode_instance_size,
+                                 prefill_decode_instance_size=prefill_decode_instance_size,)
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+                                      parallel_config.pipeline_parallel_size,
+                                      prefill_instance_size=prefill_instance_size,
+                                      decode_instance_size=decode_instance_size,
+                                      prefill_decode_instance_size=prefill_decode_instance_size,)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

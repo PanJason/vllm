@@ -9,7 +9,7 @@ from transformers import PreTrainedTokenizer
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig, LoadConfig,
                          LoRAConfig, ModelConfig, MultiModalConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
-                         SpeculativeConfig)
+                         SpeculativeConfig, DisaggregateConfig)
 from vllm.core.scheduler import (ScheduledSequenceGroup, Scheduler,
                                  SchedulerOutputs)
 from vllm.engine.arg_utils import EngineArgs
@@ -161,6 +161,7 @@ class LLMEngine:
         speculative_config: Optional[SpeculativeConfig],
         decoding_config: Optional[DecodingConfig],
         observability_config: Optional[ObservabilityConfig],
+        disaggregate_config: Optional[DisaggregateConfig],
         executor_class: Type[ExecutorBase],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
@@ -249,6 +250,7 @@ class LLMEngine:
             lora_config=lora_config,
             multimodal_config=multimodal_config,
             speculative_config=speculative_config,
+            disaggregate_config=disaggregate_config,
             load_config=load_config,
         )
 
